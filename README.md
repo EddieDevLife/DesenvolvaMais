@@ -9,7 +9,8 @@ Notas de estudo sobre arquitetura e resiliência de APIs com Spring (Spring Boot
 1. [Spring MVC vs Spring WebFlux e Virtual Threads](#1-spring-mvc-vs-spring-webflux-e-virtual-threads)
 2. [Mecanismos de resiliência (Resilience4j)](#2-mecanismos-de-resiliência-resilience4j)
 3. [Testando a resiliência quando a API externa cai](#3-testando-a-resiliência-quando-a-api-externa-cai)
-4. [Fontes](#fontes)
+4. [Cenários de risco no pagamento (Engenharia do Caos)](#4-cenários-de-risco-no-pagamento-engenharia-do-caos)
+5. [Fontes](#fontes)
 
 ---
 
@@ -142,6 +143,42 @@ Versão 4.0.0, compatível com Boot 4, voltado para homologação. Injeta latên
 ### Próximo passo
 
 Combinar teste de carga (Gatling ou k6) com essas falhas e acompanhar as métricas do Resilience4j no Actuator/Micrometer. Assim você vê se as threads e os pools saturam quando a dependência fica lenta, que é exatamente o cenário em que Virtual Threads sem Bulkhead podem dar problema.
+
+---
+
+## 4. Cenários de risco no pagamento (Engenharia do Caos)
+
+Na Engenharia do Caos, você define como o sistema deveria se comportar, injeta a falha de propósito e verifica se esse comportamento se manteve. Estas são as perguntas de risco para o fluxo de pagamento.
+
+### 4.1 "E se o gateway aprovar a cobrança, mas a resposta se perder no caminho? Marcamos como recusado um pagamento que foi aprovado?"
+
+- **Risco:** o cliente é cobrado, mas o pedido aparece como recusado. Se ele tentar de novo e o sistema gerar uma nova Idempotency-Key, ele é cobrado duas vezes. No melhor caso, sobra um estorno manual para o suporte.
+- **Experimento:** no WireMock, configure o `POST /cobrancas` com `withFixedDelay` maior que o read timeout, ou com `Fault.CONNECTION_RESET_BY_PEER`. Ao mesmo tempo, faça o stub de consulta do gateway responder "APROVADO" para aquela chave.
+- **Defesa esperada:** timeout não significa falha. O pagamento deve ir para `PENDENTE_CONFIRMACAO`, e só vira `RECUSADO` com uma recusa explícita do gateway. Um job de conciliação consulta o gateway usando a mesma chave, e o webhook de confirmação também resolve o estado.
+- **Como validar:** nenhum pagamento termina `RECUSADO` depois de um timeout, e após a conciliação o estado local é igual ao estado no gateway.
+
+### 4.2 "E se o gateway ficar lento (5 s por resposta) no pico de vendas? As threads e conexões ficam presas e o sistema inteiro cai junto?"
+
+- **Risco:** efeito cascata. Com Virtual Threads, nada limita a concorrência, e o pool do HikariCP se esgota. Isso piora se a transação do banco ficar aberta durante a chamada HTTP. Além disso, os retries multiplicam a carga sobre um gateway que já está degradado (*retry storm*).
+- **Experimento:** use o Toxiproxy com `latency` de 5000 ms entre a aplicação e o gateway (ou o `withLogNormalRandomDelay` do WireMock), combinado com um teste de carga no k6 ou no Gatling.
+- **Defesa esperada:**
+  - timeouts curtos no cliente HTTP;
+  - Bulkhead limitando as chamadas simultâneas ao gateway;
+  - Circuit Breaker com `slowCallRateThreshold`;
+  - retry com backoff, jitter e poucas tentativas, configurado para não retentar `CallNotPermittedException`;
+  - nunca segurar conexão ou transação do banco durante a chamada externa.
+- **Como validar:** os endpoints que não dependem do pagamento (catálogo, consulta de pedido) mantêm o p99 normal, o pool de conexões não satura, o circuito abre e o checkout responde rápido com "pagamento em processamento".
+
+### 4.3 "E se o webhook de confirmação chegar duplicado, atrasado ou fora de ordem (o 'estornado' antes do 'aprovado')?"
+
+- **Risco:** o pedido é liberado duas vezes, o estoque é baixado em dobro, ou um pagamento estornado volta para "aprovado".
+- **Experimento:** reenvie o mesmo evento várias vezes, inverta a ordem dos eventos, atrase a entrega, e dispare o webhook enquanto o POST original ainda está em processamento.
+- **Defesa esperada:**
+  - deduplicação pelo ID do evento, com uma tabela de eventos processados com restrição de unicidade;
+  - máquina de estados que só aceita transições válidas (`APROVADO → ESTORNADO`, nunca o contrário);
+  - lock otimista (coluna de versão) na linha do pagamento;
+  - validação da assinatura do webhook.
+- **Como validar:** depois do replay e da reordenação, o estado final está correto, e os efeitos colaterais (e-mail, baixa de estoque) acontecem exatamente uma vez.
 
 ---
 
