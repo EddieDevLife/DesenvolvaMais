@@ -196,3 +196,56 @@ Na Engenharia do Caos, você define como o sistema deveria se comportar, injeta 
 - WireMock: [Simulating Faults](https://wiremock.org/docs/simulating-faults/) · [Stateful Behaviour](https://wiremock.org/docs/stateful-behaviour/)
 - [Testcontainers: Toxiproxy Module](https://java.testcontainers.org/modules/toxiproxy/)
 - [Chaos Monkey for Spring Boot: Reference Guide](https://codecentric.github.io/chaos-monkey-spring-boot/latest/)
+
+
+## 1. Escolha de Paradigma da API
+
+- **A Escolha:** (X) Spring MVC com Virtual Threads ou ( ) Spring WebFlux (Reativo)?
+- **Justificativa:** Considerando a capacidade de suportar 10k acessos concorrentes, por que você fez essa escolha técnica?
+  > O checkout é um fluxo request-response dominado por I/O bloqueante: grava no banco (JPA/JDBC) e espera a resposta do parceiro de pagamentos. Na maior parte do tempo, cada requisição está apenas esperando. Com Virtual Threads (`spring.threads.virtual.enabled=true`, JDK 25), cada uma das 10k requisições concorrentes ganha sua própria virtual thread. Ela custa poucos KB e libera a thread portadora enquanto espera o I/O. O teto de 200 threads do Tomcat deixa de existir, e chegamos à mesma escalabilidade de I/O do WebFlux sem reescrever o sistema em estilo reativo.
+  >
+  > Escolhi MVC porque:
+  > - o código continua imperativo: mais simples de ler, depurar e testar, com stack traces legíveis e `@Transactional` funcionando normalmente;
+  > - o WebFlux exigiria uma stack 100% não bloqueante (R2DBC, WebClient), e um único driver bloqueante no event loop anularia a vantagem;
+  > - não temos requisitos de streaming nem de backpressure, que são os casos em que o WebFlux realmente ganha;
+  > - no JDK 24+ (JEP 491), `synchronized` não prende mais a thread portadora, o que remove o principal risco das virtual threads no Java 21.
+  >
+  > Cuidados para os 10k concorrentes: as virtual threads removem o limite de threads, mas não o limite dos recursos. 10k requisições não cabem num pool de ~50 conexões do HikariCP nem na cota do parceiro. Por isso:
+  > - limitamos explicitamente as chamadas ao parceiro com Bulkhead (seção 2);
+  > - nunca seguramos conexão ou transação do banco enquanto esperamos o parceiro;
+  > - ajustamos `server.tomcat.max-connections` (padrão 8192) para acima de 10k;
+  > - validamos o dimensionamento com teste de carga (k6 ou Gatling com 10k usuários virtuais).
+
+## 2. Desenho de Resiliência
+
+Dependemos de uma API terceira instável. Quais recursos do padrão de resiliência você vai utilizar?
+
+- **Proteção contra Falhas e Lentidão:**
+  Quais padrões (Circuit Breaker, TimeLimiter, RateLimiter, Bulkhead, Retry) você implementaria na chamada para o Parceiro de Pagamentos? Por que?
+  > Uso todos, cada um contra um tipo de falha, na ordem `Retry( CircuitBreaker( RateLimiter( Bulkhead( chamada com timeout ))))`:
+  >
+  > - **Timeout / TimeLimiter:** a chamada é síncrona (`RestClient` numa virtual thread), então o limite de tempo fica no próprio cliente HTTP (connect de ~1 s e read de ~3 s). O TimeLimiter do Resilience4j só atua sobre `CompletableFuture` e seria usado apenas se a chamada fosse assíncrona. Sem timeout, um parceiro lento prende threads e conexões indefinidamente.
+  > - **Circuit Breaker:** abre quando a taxa de falhas passa de 50% ou quando as chamadas acima de 3 s viram maioria (`slowCallRateThreshold`), numa janela das últimas ~50 chamadas. Aberto, ele falha na hora, sem gastar recursos com um parceiro fora do ar, e dá tempo para o parceiro se recuperar. O fallback nunca diz "aprovado": o pagamento fica `PENDENTE` e é reprocessado de forma assíncrona. Se o negócio não aceitar pedido sem autorização imediata, o checkout responde 503 com `Retry-After`.
+  > - **Bulkhead (semáforo):** limita as chamadas simultâneas ao parceiro, com o limite dimensionado pela capacidade dele (por exemplo, 200) e espera curta. É essencial com Virtual Threads: sem ele, as 10k requisições iriam todas ao mesmo tempo para o parceiro, esgotariam as conexões e derrubariam junto o resto do sistema.
+  > - **Retry:** no máximo 3 tentativas no total, com backoff exponencial e jitter, apenas para erros transitórios (timeout de conexão, connection reset, 502/503/504). Nunca retenta 4xx (cartão recusado, dados inválidos), nem `CallNotPermittedException` ou `BulkheadFullException`. Todo retry reenvia a **mesma** `Idempotency-Key`.
+  > - **RateLimiter:** mantém nosso volume abaixo da cota contratada com o parceiro, evitando respostas 429 ou bloqueio. Se o parceiro não publicar limite, o Bulkhead já basta.
+  >
+  > As métricas do Resilience4j vão para o Actuator/Micrometer, com alerta quando o circuito abrir.
+
+- **Proteção contra Duplicidade:**
+  Como a `Idempotency-Key` será utilizada na requisição do Checkout para evitar cobranças duplas? Qual o ciclo de vida dessa chave?
+  > A chave protege os dois trechos: do frontend para o nosso checkout, e do checkout para o parceiro.
+  >
+  > **Uso na requisição:**
+  > 1. **Geração:** o frontend gera um UUID v4 quando o checkout é aberto, uma chave por tentativa de compra e não por clique. Duplo clique, refresh e retries de rede reenviam a mesma chave no header `Idempotency-Key` do `POST /checkout`.
+  > 2. **Recebimento:** a API exige o header (400 se faltar) e valida o corpo antes de reservar a chave, então erros de validação não ficam gravados. Em seguida, calcula o hash SHA-256 do corpo e tenta inserir (`chave`, `cliente`, `hash`, status `PROCESSANDO`) na tabela `idempotency_keys`, que tem restrição de unicidade em (`chave`, `cliente`):
+  >    - se inseriu, a chave é nova e o processamento segue;
+  >    - se já existe, está concluída e tem o mesmo hash, a API devolve a resposta armazenada sem cobrar de novo;
+  >    - se já existe e ainda está `PROCESSANDO`, responde 409 Conflict;
+  >    - se já existe com hash diferente, responde 422 Unprocessable Content.
+  > 3. **Chamada ao parceiro:** o checkout repassa ao parceiro uma chave estável (a mesma chave ou o ID do pagamento), e o Retry do Resilience4j reutiliza essa chave. Assim, se a cobrança passou e só a resposta se perdeu, o parceiro reconhece a repetição e não cobra duas vezes.
+  > 4. **Conclusão:** o status e o corpo da resposta são gravados junto com o estado do pagamento, na mesma transação, e a chave vira `CONCLUIDA`. Se o resultado for incerto (timeout), o pagamento fica `PENDENTE_CONFIRMACAO`. Um retry do cliente com a mesma chave recebe esse estado, e a conciliação (consulta ao parceiro ou webhook) resolve o resultado final.
+  >
+  > **Ciclo de vida:** `gerada no cliente → PROCESSANDO → CONCLUIDA (resposta armazenada) → expirada após TTL de 24 h`. O TTL precisa ser maior que a janela de retries do cliente. Um job remove as chaves expiradas, e uma requisição que chegar depois disso é tratada como nova.
+  >
+  > Como última linha de defesa, um índice único parcial garante no máximo um pagamento aprovado por pedido. Assim, nem um bug na camada de idempotência gera duas cobranças para o mesmo pedido.
