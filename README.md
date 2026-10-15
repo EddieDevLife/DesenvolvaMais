@@ -6,6 +6,11 @@ Notas de estudo sobre arquitetura e resiliência de APIs com Spring (Spring Boot
 
 ## Sumário
 
+### Módulos e Aulas
+- **Aula 02:** [Arquitetura e Resiliência de APIs](#1-spring-mvc-vs-spring-webflux-e-virtual-threads)
+- **Aula 03:** [Banco de Dados em Larga Escala - System Design](aulas/aula-03/PE-JV-003-Aula-03-Template-System-Design.md)
+
+### Conteúdo da Aula 02
 1. [Spring MVC vs Spring WebFlux e Virtual Threads](#1-spring-mvc-vs-spring-webflux-e-virtual-threads)
 2. [Mecanismos de resiliência (Resilience4j)](#2-mecanismos-de-resiliência-resilience4j)
 3. [Testando a resiliência quando a API externa cai](#3-testando-a-resiliência-quando-a-api-externa-cai)
