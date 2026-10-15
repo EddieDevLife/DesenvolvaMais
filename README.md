@@ -155,21 +155,107 @@ Na Engenharia do Caos, você define como o sistema deveria se comportar, injeta 
 
 - **Risco:** o cliente é cobrado, mas o pedido aparece como recusado. Se ele tentar de novo e o sistema gerar uma nova Idempotency-Key, ele é cobrado duas vezes. No melhor caso, sobra um estorno manual para o suporte.
 
-R: não. No nosso desenho, timeout não é recusa. Um resultado desconhecido vira `PENDENTE_CONFIRMACAO`, e só o gateway pode dizer se a cobrança passou.
+**R:** Não. No nosso desenho, timeout não é recusa. Um resultado desconhecido vira `PENDENTE_CONFIRMACAO`, e só o gateway pode dizer se a cobrança passou.
+
+- **Antes da chamada:** o pagamento é gravado como `PROCESSANDO`, junto com a Idempotency-Key que será enviada ao gateway, numa transação curta que já faz commit.
+- **Na resposta:** uma aprovação vira `APROVADO` e uma recusa explícita vira `RECUSADO`. Qualquer resultado incerto vira `PENDENTE_CONFIRMACAO`: read timeout, connection reset, 5xx depois dos retries, circuito aberto ou bulkhead cheio. Nesses dois últimos casos, uma tentativa anterior pode ter chegado ao gateway. O cliente vê "pagamento em processamento", nunca "recusado".
+- **Resolução:** o webhook do gateway, ou um job de conciliação que roda a cada minuto, consulta a cobrança pela mesma chave. Se o gateway não conhecer a cobrança depois de uma janela de segurança (por exemplo, 15 min), o pagamento vira `FALHOU`, porque a cobrança nunca aconteceu, e o cliente pode tentar de novo.
+- **Retry do cliente:** o frontend mantém a mesma Idempotency-Key enquanto o pedido não termina. Por isso, uma nova tentativa recebe o estado atual em vez de gerar outra cobrança.
+
+```java
+try {
+    var resposta = gateway.cobrar(pagamento.idempotencyKey(), pedido);
+    pagamento.mudarPara(resposta.aprovada() ? APROVADO : RECUSADO);
+} catch (ResourceAccessException | HttpServerErrorException
+         | CallNotPermittedException | BulkheadFullException e) {
+    pagamento.mudarPara(PENDENTE_CONFIRMACAO); // resultado desconhecido: nunca RECUSADO
+}
+```
+
+**Teste:** o stub do `POST /cobrancas` atrasa 5 s, e o stub de consulta responde `APROVADO`. O teste verifica três coisas: que o checkout devolve `PENDENTE_CONFIRMACAO`, que todos os POSTs ao gateway levaram a mesma chave (`findAll(postRequestedFor(...))`), e que, depois de rodar a conciliação, o pagamento está `APROVADO`.
 
 
 ### 4.2 "E se o gateway ficar lento (5 s por resposta) no pico de vendas? As threads e conexões ficam presas e o sistema inteiro cai junto?"
 
 - **Risco:** efeito cascata. Com Virtual Threads, nada limita a concorrência, e o pool do HikariCP se esgota. Isso piora se a transação do banco ficar aberta durante a chamada HTTP. Além disso, os retries multiplicam a carga sobre um gateway que já está degradado (*retry storm*).
 
-R:não. A lentidão fica contida no checkout, e o resto do sistema continua respondendo.
+**R:** Não. A lentidão fica contida no checkout, e o resto do sistema continua respondendo.
+
+- **Ninguém espera 5 s:** o read timeout do `RestClient` é de 3 s.
+- **O circuito abre rápido:** chamadas acima de 2 s contam como lentas. Quando elas passam de 50% numa janela de 50 chamadas, o circuito abre, e o checkout passa a responder na hora com "pagamento em processamento" (`PENDENTE_CONFIRMACAO`, reprocessado depois).
+- **Concorrência limitada:** o Bulkhead permite no máximo 200 chamadas simultâneas ao gateway, com espera de 50 ms. O excedente recebe resposta imediata em vez de se acumular.
+- **Sem retry storm:** são no máximo 3 tentativas, com backoff exponencial (com jitter, via um `intervalFunction` randomizado), e nenhum retry quando o circuito está aberto ou o bulkhead está cheio. A carga sobre o gateway multiplica por no máximo 3, e só enquanto o circuito está fechado.
+- **Banco fora da espera:** o fluxo usa duas transações curtas, uma para gravar `PROCESSANDO` e outra para gravar o resultado. A chamada HTTP acontece entre as duas, sem prender nenhuma conexão do HikariCP. Um `@Transactional` envolvendo a chamada ao gateway seguraria uma conexão por 5 s e esgotaria o pool do sistema inteiro.
+
+```yaml
+resilience4j:
+  circuitbreaker.instances.gateway:
+    slidingWindowSize: 50
+    failureRateThreshold: 50
+    slowCallDurationThreshold: 2s
+    slowCallRateThreshold: 50
+    waitDurationInOpenState: 30s
+  bulkhead.instances.gateway:
+    maxConcurrentCalls: 200
+    maxWaitDuration: 50ms
+  retry.instances.gateway:
+    maxAttempts: 3
+    waitDuration: 500ms
+    enableExponentialBackoff: true
+    exponentialBackoffMultiplier: 2
+    ignoreExceptions:
+      - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+      - io.github.resilience4j.bulkhead.BulkheadFullException
+```
+
+**Teste:** o Toxiproxy aplica `latency` de 5000 ms na frente do gateway, e o k6 gera carga no checkout e no catálogo ao mesmo tempo. Os critérios de sucesso são:
+
+- p99 do catálogo igual ao baseline;
+- `hikaricp_connections_pending` em zero;
+- `resilience4j_circuitbreaker_state` indo para `OPEN` em segundos;
+- checkout respondendo em menos de 100 ms depois que o circuito abre.
 
 
 ### 4.3 "E se o webhook de confirmação chegar duplicado, atrasado ou fora de ordem (o 'estornado' antes do 'aprovado')?"
 
 - **Risco:** o pedido é liberado duas vezes, o estoque é baixado em dobro, ou um pagamento estornado volta para "aprovado".
 
-  R:não. O webhook é processado de forma idempotente e só pode mover o pagamento para a frente.
+**R:** Não. O webhook é processado de forma idempotente e só pode mover o pagamento para a frente.
+
+- **Autenticidade:** a assinatura HMAC do webhook é validada antes de tudo. Assinatura inválida recebe 401.
+- **Duplicado:** o ID do evento é inserido em `eventos_processados` com `INSERT ... ON CONFLICT DO NOTHING`. Se o ID já existia, a API responde 200 sem efeito nenhum, para o gateway parar de reenviar.
+- **Fora de ordem:** a máquina de estados só aceita transições válidas, e a mesma regra vale para o checkout, a conciliação e o webhook. Um estorno é verdade final, então é aceito mesmo vindo de `PROCESSANDO` ou `PENDENTE_CONFIRMACAO`. Já um "aprovado" que chega depois do "estornado" é ignorado e registrado em log.
+- **Concorrência com o POST:** o pagamento tem uma coluna `@Version`. Se o webhook e o checkout gravarem ao mesmo tempo, um deles recebe conflito, a transação inteira é desfeita (inclusive o registro do evento) e a API responde 5xx. O gateway então reenvia o webhook, que é reprocessado sobre o estado já atualizado.
+- **Efeitos colaterais exatamente uma vez:** o registro do evento, a mudança de estado e uma entrada na tabela de outbox são gravados na mesma transação. O e-mail e a baixa de estoque saem do outbox, com consumidores que deduplicam pelo ID da mensagem.
+
+```java
+enum StatusPagamento {
+    PROCESSANDO, PENDENTE_CONFIRMACAO, APROVADO, RECUSADO, FALHOU, ESTORNADO;
+
+    private static final Map<StatusPagamento, Set<StatusPagamento>> TRANSICOES = Map.of(
+        PROCESSANDO,          Set.of(APROVADO, RECUSADO, PENDENTE_CONFIRMACAO, ESTORNADO),
+        PENDENTE_CONFIRMACAO, Set.of(APROVADO, RECUSADO, FALHOU, ESTORNADO),
+        APROVADO,             Set.of(ESTORNADO),
+        RECUSADO,             Set.of(),
+        FALHOU,               Set.of(),
+        ESTORNADO,            Set.of());
+
+    boolean podeIrPara(StatusPagamento destino) {
+        return TRANSICOES.get(this).contains(destino);
+    }
+}
+
+@Transactional
+public void processar(EventoGateway evento) {
+    if (!eventos.registrarSeNovo(evento.id())) return;            // duplicado
+    var pagamento = pagamentos.buscarPorChave(evento.idempotencyKey());
+    if (!pagamento.status().podeIrPara(evento.status())) return;  // fora de ordem (logado)
+    pagamento.mudarPara(evento.status());                         // @Version: conflito -> rollback
+    outbox.registrar(new PagamentoMudouDeStatus(pagamento.id(), evento.status()));
+}
+```
+
+**Teste:** o teste envia o mesmo webhook 3 vezes, envia `ESTORNADO` antes de `APROVADO`, e dispara o webhook enquanto o POST ainda está em andamento (WireMock com delay no gateway). Ele verifica que o estado final é `ESTORNADO`, que existe uma linha em `eventos_processados` por evento, e que os mocks de e-mail e de estoque foram chamados exatamente uma vez por mudança de estado.
 
 
 ---
